@@ -21,6 +21,7 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -40,6 +41,8 @@ import androidx.compose.ui.graphics.*
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -76,7 +79,14 @@ class MainActivity : ComponentActivity() {
         setContent { AlisanAiApp() }
     }
     override fun onDestroy() { tts?.stop(); tts?.shutdown(); super.onDestroy() }
-    fun speak(text: String) { tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "alisan_ai_reply") }
+    fun speak(text: String, language: String = "fa") {
+        val locale = if (language == "en") Locale.US else Locale("fa", "IR")
+        val result = tts?.setLanguage(locale)
+        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+            tts?.setLanguage(if (language == "en") Locale.ENGLISH else Locale("fa"))
+        }
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "alisan_ai_reply")
+    }
 }
 
 data class AiSource(val title: String, val url: String)
@@ -135,6 +145,7 @@ fun AlisanAiApp() {
     var isLoading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val keyboard = LocalSoftwareKeyboardController.current
+    val clipboard = LocalClipboardManager.current
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     LaunchedEffect(showDrawer) { if (showDrawer) drawerState.open() else drawerState.close() }
 
@@ -161,9 +172,21 @@ fun AlisanAiApp() {
         message = ""; currentTab = "chat"; isLoading = true
         scope.launch {
             try {
-                val result = requestAlisanAi(q)
+                val history = chat.dropLast(2).takeLast(16).joinToString("\n") { line ->
+                    (if (line.isUser) (if (en) "User" else "کاربر") else "Alisan AI") + ": " + line.text.take(1800)
+                }
+                val languageInstruction = if (en)
+                    "Answer naturally in English. Understand the user's intent from the conversation context; do not define individual words unless asked. Be accurate, relevant, concise, and use a few fitting emojis naturally. If unsure, say so. Keep correct English grammar and formatting."
+                else
+                    "فقط فارسی روان و طبیعی جواب بده. منظور جمله را با توجه به زمینه و پیام‌های قبلی بفهم؛ کلمه‌ها را جداگانه معنی نکن مگر اینکه کاربر معنی کلمه را خواسته باشد. دقیق، مرتبط و روشن پاسخ بده؛ از چند ایموجی مناسب و به‌اندازه استفاده کن. اگر مطمئن نیستی صادقانه بگو. دستور زبان و نیم‌فاصله فارسی را رعایت کن."
+                val contextualMessage = buildString {
+                    append("[ASSISTANT INSTRUCTIONS]\n").append(languageInstruction).append("\n")
+                    if (history.isNotBlank()) append("[CONVERSATION HISTORY]\n").append(history).append("\n")
+                    append("[LATEST USER MESSAGE]\n").append(q)
+                }
+                val result = requestAlisanAi(contextualMessage)
                 chat = chat.dropLast(1) + ChatLine(result.answer, false, result.sources)
-                activity.speak(result.answer.take(3500))
+                activity.speak(result.answer.take(3500), language)
             } catch (e: Exception) {
                 chat = chat.dropLast(1) + ChatLine((if (en) "Couldn't connect to Alisan AI. Check your internet and server.\n" else "اتصال به هوش مصنوعی ناموفق بود. اینترنت و Worker را بررسی کن.\n") + (e.message ?: ""), false)
             } finally { isLoading = false; persist() }
@@ -172,7 +195,7 @@ fun AlisanAiApp() {
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) startListening(context, { listening = it }, { sendMessage(it) }, { listening = false; speechError = if (en) "Speech recognition failed." else "صدای شما تشخیص داده نشد؛ دوباره امتحان کن." })
+        if (granted) startListening(context, language, { listening = it }, { sendMessage(it) }, { listening = false; speechError = if (en) "Speech recognition failed." else "صدای شما تشخیص داده نشد؛ دوباره امتحان کن." })
         else speechError = if (en) "Microphone permission is required." else "برای استفاده از میکروفون اجازه لازم است."
     }
     val transition = rememberInfiniteTransition(label = "glow")
@@ -219,8 +242,17 @@ fun AlisanAiApp() {
                     }, { n -> notes = notes.filterNot { it == n }; prefs.edit().putStringSet("notes", notes.toSet()).apply() }, en)
                     else -> ChatScreen(chat, message, { message = it }, listening, speechError, pulse, isLoading, en,
                         onSend = { sendMessage(message) },
-                        onMic = { if (listening) listening = false else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) startListening(context, { listening = it }, { sendMessage(it) }, { listening = false; speechError = if (en) "Speech recognition failed." else "تشخیص صدا ناموفق بود." }) else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO) },
-                        onOpenLink = { url -> runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) } })
+                        onMic = { if (listening) listening = false else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) startListening(context, language, { listening = it }, { sendMessage(it) }, { listening = false; speechError = if (en) "Speech recognition failed. Check your device's speech service and language pack." else "تشخیص صدا ناموفق بود؛ سرویس گفتار و زبان فارسی گوشی را بررسی کن." }) else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO) },
+                        onOpenLink = { url -> runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) } },
+                        onCopy = { clipboard.setText(AnnotatedString(it)) },
+                        onSpeak = { activity.speak(it, language) },
+                        onRetry = { index ->
+                            val previousUser = chat.take(index).lastOrNull { it.isUser }?.text
+                            if (previousUser != null && !isLoading) {
+                                chat = chat.take((index - 1).coerceAtLeast(0))
+                                sendMessage(previousUser)
+                            }
+                        })
                 }
             }
         }
@@ -236,7 +268,7 @@ fun AlisanAiApp() {
 }
 
 @Composable
-private fun ChatScreen(chat: List<ChatLine>, message: String, onMessage: (String) -> Unit, listening: Boolean, speechError: String, pulse: Float, isLoading: Boolean, en: Boolean, onSend: () -> Unit, onMic: () -> Unit, onOpenLink: (String) -> Unit) {
+private fun ChatScreen(chat: List<ChatLine>, message: String, onMessage: (String) -> Unit, listening: Boolean, speechError: String, pulse: Float, isLoading: Boolean, en: Boolean, onSend: () -> Unit, onMic: () -> Unit, onOpenLink: (String) -> Unit, onCopy: (String) -> Unit, onSpeak: (String) -> Unit, onRetry: (Int) -> Unit) {
     val keyboard = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
     Column(Modifier.fillMaxSize().imePadding().padding(horizontal = 16.dp)) {
@@ -254,7 +286,7 @@ private fun ChatScreen(chat: List<ChatLine>, message: String, onMessage: (String
             }
         } else {
             LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                items(chat) { line ->
+                itemsIndexed(chat) { index, line ->
                     if (line.isUser) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                         Text(line.text, Modifier.widthIn(max = 310.dp).background(SurfaceRaised, RoundedCornerShape(18.dp)).padding(13.dp), color = TextMain, fontSize = 15.sp)
                     } else Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
@@ -263,6 +295,13 @@ private fun ChatScreen(chat: List<ChatLine>, message: String, onMessage: (String
                         Column(Modifier.weight(1f)) {
                             Text("Alisan AI", color = Cyan, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                             Spacer(Modifier.height(5.dp)); Text(line.text, color = TextMain, fontSize = 15.sp, lineHeight = 23.sp)
+                            if (!line.text.startsWith("در حال دریافت") && line.text != "Thinking…") {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton(onClick = { onCopy(line.text) }, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.ContentCopy, if (en) "Copy" else "کپی", tint = TextMuted, modifier = Modifier.size(17.dp)) }
+                                    IconButton(onClick = { onRetry(index) }, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.Refresh, if (en) "Regenerate" else "پاسخ دوباره", tint = TextMuted, modifier = Modifier.size(18.dp)) }
+                                    IconButton(onClick = { onSpeak(line.text) }, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.VolumeUp, if (en) "Read aloud" else "خواندن با صدا", tint = Cyan, modifier = Modifier.size(18.dp)) }
+                                }
+                            }
                             line.sources.forEach { source ->
                                 Spacer(Modifier.height(7.dp))
                                 Row(Modifier.fillMaxWidth().background(SurfaceDark, RoundedCornerShape(11.dp)).clickable { onOpenLink(source.url) }.padding(11.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -334,10 +373,10 @@ private suspend fun requestAlisanAi(message: String): AiReply = withContext(Disp
     } finally { connection.disconnect() }
 }
 
-private fun startListening(context: Context, onListening: (Boolean) -> Unit, onResult: (String) -> Unit, onFailure: () -> Unit) {
+private fun startListening(context: Context, language: String, onListening: (Boolean) -> Unit, onResult: (String) -> Unit, onFailure: () -> Unit) {
     if (!SpeechRecognizer.isRecognitionAvailable(context)) { onFailure(); return }
     val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
-    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply { putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM); putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fa-IR"); putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "fa-IR") }
+    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply { putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM); putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (language == "en") "en-US" else "fa-IR"); putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, if (language == "en") "en-US" else "fa-IR"); putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false); putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1) }
     recognizer.setRecognitionListener(object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) { onListening(true) }; override fun onBeginningOfSpeech() { onListening(true) }; override fun onRmsChanged(rmsdB: Float) {}; override fun onBufferReceived(buffer: ByteArray?) {}; override fun onEndOfSpeech() { onListening(false) }
         override fun onError(error: Int) { onListening(false); onFailure(); recognizer.destroy() }

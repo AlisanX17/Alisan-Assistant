@@ -57,7 +57,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import java.net.HttpURLConnection
 import java.net.URLEncoder
+import java.net.URL
+import org.json.JSONObject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Calendar
 import java.util.Locale
 
@@ -103,17 +109,36 @@ fun AlisanAiApp() {
     var showAlarm by remember { mutableStateOf(false) }
     var listening by remember { mutableStateOf(false) }
     var speechError by remember { mutableStateOf("") }
-    var chat by remember { mutableStateOf(listOf(ChatLine("سلام! من Alisan AI هستم 💙 هر چیزی خواستی بنویس یا روی میکروفون بزن. می‌تونم کمکت کنم جست‌وجو کنی، یادداشت بسازی و یادآوری تنظیم کنی.", false))) }
+    var isLoading by remember { mutableStateOf(false) }
+    val coroutineScope = rememberCoroutineScope()
+    var chat by remember { mutableStateOf(listOf(ChatLine("سلام! من Alisan AI هستم 💙 هر چیزی خواستی بنویس یا روی میکروفون بزن. می‌تونم به هوش مصنوعی آنلاین وصل بشم، یادداشت بسازی و یادآوری تنظیم کنی.", false))) }
 
     fun sendMessage(raw: String) {
         val q = raw.trim()
-        if (q.isBlank()) return
-        chat = chat + ChatLine(q, true)
-        val reply = makeReply(q)
-        chat = chat + reply
-        if (reply.link == null) activity.speak(reply.text) else activity.speak("لینک جست‌وجو رو برات آماده کردم")
+        if (q.isBlank() || isLoading) return
+        chat = chat + ChatLine(q, true) + ChatLine("در حال دریافت پاسخ از هوش مصنوعی…", false)
         message = ""
         currentTab = "chat"
+        isLoading = true
+        coroutineScope.launch {
+            try {
+                val result = requestAlisanAi(q)
+                val sourceText = if (result.sources.isNotEmpty()) {
+                    "\n\nمنابع وب:\n" + result.sources.take(5).mapIndexed { index, source ->
+                        "${index + 1}. ${source.title}"
+                    }.joinToString("\n")
+                } else ""
+                val reply = ChatLine(result.answer + sourceText, false, result.sources.firstOrNull()?.url)
+                chat = chat.dropLast(1) + reply
+                activity.speak(result.answer.take(3500))
+            } catch (e: Exception) {
+                val errorText = "اتصال به هوش مصنوعی ناموفق بود. اینترنت و Worker را بررسی کن.\nجزئیات: ${e.message ?: "خطای ناشناخته"}"
+                chat = chat.dropLast(1) + ChatLine(errorText, false)
+                activity.speak("اتصال به هوش مصنوعی ناموفق بود")
+            } finally {
+                isLoading = false
+            }
+        }
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -140,7 +165,7 @@ fun AlisanAiApp() {
                 }, onDelete = { note -> notes = notes.filterNot { it == note }; prefs.edit().putStringSet("notes", notes.toSet()).apply() })
                 else -> ChatScreen(
                     chat = chat, message = message, onMessage = { message = it }, listening = listening,
-                    speechError = speechError, pulse = pulse,
+                    speechError = speechError, pulse = pulse, isLoading = isLoading,
                     onSend = { sendMessage(message) },
                     onMic = {
                         if (listening) { listening = false }
@@ -210,7 +235,8 @@ private fun TabPill(label: String, selected: Boolean, modifier: Modifier = Modif
 @Composable
 private fun ChatScreen(
     chat: List<ChatLine>, message: String, onMessage: (String) -> Unit, listening: Boolean, speechError: String, pulse: Float,
-    onSend: () -> Unit, onMic: () -> Unit, onQuick: (String) -> Unit, onOpenLink: (String) -> Unit
+    onSend: () -> Unit, onMic: () -> Unit, onQuick: (String) -> Unit, onOpenLink: (String) -> Unit,
+    isLoading: Boolean
 ) {
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         if (chat.size <= 1) {
@@ -272,6 +298,13 @@ private fun ChatScreen(
         AnimatedVisibility(visible = listening) {
             Text("در حال گوش دادن به صدای فارسی…", color = Cyan, fontSize = 13.sp, modifier = Modifier.fillMaxWidth().padding(bottom = 7.dp), textAlign = TextAlign.Center)
         }
+        AnimatedVisibility(visible = isLoading) {
+            Row(Modifier.fillMaxWidth().padding(bottom = 7.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Cyan, strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("Alisan AI در حال فکر کردنه…", color = Cyan, fontSize = 12.sp)
+            }
+        }
         AnimatedVisibility(visible = speechError.isNotBlank()) {
             Text(speechError, color = Color(0xFFFCA5A5), fontSize = 12.sp, modifier = Modifier.fillMaxWidth().padding(bottom = 7.dp))
         }
@@ -282,7 +315,7 @@ private fun ChatScreen(
             BasicTextField(value = message, onValueChange = onMessage, modifier = Modifier.weight(1f).padding(horizontal = 12.dp), textStyle = androidx.compose.ui.text.TextStyle(color = TextMain, fontSize = 15.sp), singleLine = false, maxLines = 4, decorationBox = { inner ->
                 Box { if (message.isEmpty()) Text("پیامت رو بنویس…", color = TextMuted, fontSize = 14.sp); inner() }
             })
-            IconButton(onClick = onSend, modifier = Modifier.size(42.dp).background(Brush.linearGradient(listOf(Blue, Color(0xFF6366F1))), CircleShape)) {
+            IconButton(onClick = onSend, enabled = !isLoading && message.isNotBlank(), modifier = Modifier.size(42.dp).background(Brush.linearGradient(listOf(Blue, Color(0xFF6366F1))), CircleShape)) {
                 Icon(Icons.Default.Send, contentDescription = "ارسال", tint = Color.White)
             }
         }
@@ -341,20 +374,46 @@ private fun NotesScreen(notes: List<String>, draft: String, onDraft: (String) ->
     }
 }
 
-private fun makeReply(query: String): ChatLine {
-    val q = query.lowercase(Locale.ROOT)
-    val searchTerms = listOf("طرز تهیه", "چی بپزم", "جستجو", "جست‌وجو", "لینک", "سایت", "درباره", "اخبار", "قیمت", "آموزش", "پیدا کن")
-    return when {
-        q.contains("سلام") || q.contains("درود") -> ChatLine("سلام! 💙 خوش اومدی. چه کاری برات انجام بدم؟", false)
-        q.contains("اسمت") || q.contains("اسم تو") -> ChatLine("من Alisan AI هستم؛ دستیار فارسی تو! ✨", false)
-        q.contains("ساعت") -> ChatLine("ساعت رو می‌تونی از نوار وضعیت گوشی ببینی. برای جواب‌های هوشمندتر باید سرویس هوش مصنوعی به برنامه وصل بشه.", false)
-        q.contains("یادداشت") || q.contains("نوت") -> ChatLine("از بالای صفحه وارد بخش «یادداشت‌ها» شو؛ می‌تونی یادداشت بسازی، ذخیره کنی و هر مورد رو جداگانه حذف کنی. 📝", false)
-        q.contains("آلارم") || q.contains("یادآور") -> ChatLine("برای ساخت یادآوری، آیکون زنگ بالای صفحه رو بزن و ساعت رو مثل 08:30 وارد کن. ⏰", false)
-        searchTerms.any { q.contains(it) } -> {
-            val encoded = URLEncoder.encode(query, "UTF-8")
-            ChatLine("این لینک جست‌وجوی وب برای «$query» است. نتیجه‌ها و سایت‌های مرتبط رو باز کن. 🔎", false, "https://www.google.com/search?q=$encoded")
+private data class AiSource(val title: String, val url: String)
+private data class AiReply(val answer: String, val sources: List<AiSource>)
+
+private suspend fun requestAlisanAi(message: String): AiReply = withContext(Dispatchers.IO) {
+    val connection = (URL("https://ai.hunterdns.shop/chat").openConnection() as HttpURLConnection)
+    try {
+        connection.requestMethod = "POST"
+        connection.connectTimeout = 15000
+        connection.readTimeout = 90000
+        connection.doOutput = true
+        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        connection.setRequestProperty("Accept", "application/json")
+        val requestBody = JSONObject().put("message", message).toString()
+        connection.outputStream.use { it.write(requestBody.toByteArray(Charsets.UTF_8)) }
+
+        val status = connection.responseCode
+        val stream = if (status in 200..299) connection.inputStream else connection.errorStream
+        val responseText = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: "{}"
+        val json = JSONObject(responseText)
+        if (status !in 200..299) {
+            throw Exception(json.optString("error", "خطای سرور: HTTP $status"))
         }
-        else -> ChatLine("متوجه شدم 💙 من در این نسخه هنوز به یک مدل هوش مصنوعی آنلاین متصل نیستم؛ برای پاسخ‌های واقعی مثل ChatGPT باید API یا بک‌اند هوش مصنوعی به برنامه اضافه بشه. فعلاً می‌تونی از من برای جست‌وجوی وب، یادداشت و یادآوری استفاده کنی.", false)
+
+        val answer = json.optString("answer", "").ifBlank {
+            throw Exception("سرور پاسخ خالی برگرداند.")
+        }
+        val sources = mutableListOf<AiSource>()
+        val array = json.optJSONArray("sources")
+        if (array != null) {
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val url = item.optString("url", "")
+                if (url.startsWith("https://") || url.startsWith("http://")) {
+                    sources.add(AiSource(item.optString("title", url).ifBlank { url }, url))
+                }
+            }
+        }
+        AiReply(answer, sources)
+    } finally {
+        connection.disconnect()
     }
 }
 

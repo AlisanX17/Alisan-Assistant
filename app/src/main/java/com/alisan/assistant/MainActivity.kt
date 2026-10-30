@@ -157,15 +157,19 @@ fun AlisanAiApp() {
             for (uri in uris.take((4 - selectedAttachments.size).coerceAtLeast(0))) {
                 try {
                     val item = withContext(Dispatchers.IO) { readSelectedAttachment(context, uri) }
+                    val totalSelectedSize = selectedAttachments.sumOf { it.size } + added.sumOf { it.size }
                     if (item.size > 5 * 1024 * 1024) {
                         speechError = if (en) "Each file must be 5 MB or smaller." else "حجم هر فایل باید حداکثر ۵ مگابایت باشد."
+                    } else if (totalSelectedSize + item.size > 5 * 1024 * 1024) {
+                        speechError = if (en) "The total attachment size must not exceed 5 MB." else "حجم مجموع فایل‌های پیوست نباید بیشتر از ۵ مگابایت باشد."
                     } else if (item.mimeType !in listOf("image/jpeg", "image/png", "image/webp", "application/pdf", "text/plain")) {
                         speechError = if (en) "This file type is not supported." else "این فرمت فایل پشتیبانی نمی‌شود."
                     } else {
                         added.add(item)
                     }
-                } catch (_: Exception) {
-                    speechError = if (en) "Couldn't read the selected file." else "خواندن فایل انتخاب‌شده ناموفق بود."
+                } catch (e: Exception) {
+                    val reason = "${e.javaClass.simpleName}: ${e.message ?: "unknown error"}".take(180)
+                    speechError = if (en) "Couldn't read file ($reason)" else "خطای خواندن فایل: $reason"
                 }
             }
             selectedAttachments = (selectedAttachments + added).take(4)
@@ -190,6 +194,7 @@ fun AlisanAiApp() {
     }
     fun sendMessage(raw: String) {
         val outgoingAttachments = selectedAttachments
+        val previousChat = chat
         val typed = raw.trim()
         if ((typed.isBlank() && outgoingAttachments.isEmpty()) || isLoading) return
         val q = typed.ifBlank { if (en) "Please analyze the attached file(s)." else "لطفاً فایل(های) پیوست‌شده را بررسی کن." }
@@ -202,19 +207,15 @@ fun AlisanAiApp() {
         message = ""; currentTab = "chat"; isLoading = true
         scope.launch {
             try {
-                val history = chat.dropLast(2).takeLast(16).joinToString("\n") { line ->
-                    (if (line.isUser) (if (en) "User" else "کاربر") else "Alisan AI") + ": " + line.text.take(1800)
+                val history = previousChat.takeLast(16).map { line ->
+                    (if (line.isUser) "user" else "assistant") to line.text.take(1800)
                 }
                 val languageInstruction = if (en)
                     "Answer naturally in English. Understand the user's intent from the conversation context; do not define individual words unless asked. Be accurate, relevant, concise, and use a few fitting emojis naturally. If unsure, say so. Keep correct English grammar and formatting."
                 else
                     "فقط فارسی روان و طبیعی جواب بده. منظور جمله را با توجه به زمینه و پیام‌های قبلی بفهم؛ کلمه‌ها را جداگانه معنی نکن مگر اینکه کاربر معنی کلمه را خواسته باشد. دقیق، مرتبط و روشن پاسخ بده؛ از چند ایموجی مناسب و به‌اندازه استفاده کن. اگر مطمئن نیستی صادقانه بگو. دستور زبان و نیم‌فاصله فارسی را رعایت کن."
-                val contextualMessage = buildString {
-                    append("[ASSISTANT INSTRUCTIONS]\n").append(languageInstruction).append("\n")
-                    if (history.isNotBlank()) append("[CONVERSATION HISTORY]\n").append(history).append("\n")
-                    append("[LATEST USER MESSAGE]\n").append(q)
-                }
-                val result = AlisanAiApi.ask(contextualMessage, outgoingAttachments)
+                val contextualMessage = "[ASSISTANT INSTRUCTIONS]\n$languageInstruction\n\n[LATEST USER MESSAGE]\n$q"
+                val result = AlisanAiApi.ask(contextualMessage, history, outgoingAttachments)
                 chat = chat.dropLast(1) + ChatLine(result.answer, false, result.sources)
                 activity.speak(result.answer.take(3500), language)
             } catch (e: Exception) {
@@ -410,14 +411,28 @@ private fun NotesScreen(notes: List<String>, draft: String, onDraft: (String) ->
 
 private fun readSelectedAttachment(context: Context, uri: Uri): SelectedAttachment {
     val resolver = context.contentResolver
-    val mime = resolver.getType(uri)?.lowercase() ?: "application/octet-stream"
-    var name = uri.lastPathSegment?.substringAfterLast('/') ?: "attachment"
-    resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-        if (cursor.moveToFirst()) {
-            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (index >= 0) name = cursor.getString(index) ?: name
+    var name = uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast(':') ?: "attachment"
+    try {
+        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) name = cursor.getString(index) ?: name
+            }
         }
+    } catch (_: Exception) { /* Some document providers do not expose display-name metadata. */ }
+
+    val extension = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+    val reportedMime = runCatching { resolver.getType(uri)?.lowercase(Locale.ROOT) }.getOrNull()
+    val mime = when {
+        reportedMime in listOf("image/jpeg", "image/png", "image/webp", "application/pdf", "text/plain") -> reportedMime!!
+        extension in listOf("jpg", "jpeg") -> "image/jpeg"
+        extension == "png" -> "image/png"
+        extension == "webp" -> "image/webp"
+        extension == "pdf" -> "application/pdf"
+        extension == "txt" -> "text/plain"
+        else -> reportedMime ?: "application/octet-stream"
     }
+
     val bytes = resolver.openInputStream(uri)?.use { input ->
         val output = java.io.ByteArrayOutputStream()
         val buffer = ByteArray(8192)
@@ -426,11 +441,13 @@ private fun readSelectedAttachment(context: Context, uri: Uri): SelectedAttachme
             val count = input.read(buffer)
             if (count < 0) break
             total += count
-            if (total > 5 * 1024 * 1024) throw IllegalArgumentException("File too large")
+            if (total > 5 * 1024 * 1024) throw IllegalArgumentException("File exceeds 5 MB")
             output.write(buffer, 0, count)
         }
         output.toByteArray()
-    } ?: throw IllegalArgumentException("Cannot open file")
+    } ?: throw IllegalArgumentException("Document provider returned no input stream")
+
+    if (bytes.isEmpty()) throw IllegalArgumentException("Selected file is empty")
     return SelectedAttachment(name, mime, Base64.encodeToString(bytes, Base64.NO_WRAP), bytes.size)
 }
 

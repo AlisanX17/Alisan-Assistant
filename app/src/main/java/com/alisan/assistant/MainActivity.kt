@@ -202,19 +202,15 @@ fun AlisanAiApp() {
         val attachmentLabel = outgoingAttachments.joinToString("\n") { "📎 ${it.name}" }
         val userLine = ChatLine(if (attachmentLabel.isBlank()) q else "$q\n$attachmentLabel", true)
         selectedAttachments = emptyList()
-        chat = chat + userLine + ChatLine(if (en) "Thinking…" else "در حال دریافت پاسخ…", false)
+        chat = chat + userLine + ChatLine(if (en) "Searching the web…" else "در حال جست‌وجوی وب…", false)
         message = ""; currentTab = "chat"; isLoading = true
         scope.launch {
             try {
                 val history = previousChat.takeLast(16).map { line ->
                     (if (line.isUser) "user" else "assistant") to line.text.take(1800)
                 }
-                val languageInstruction = if (en)
-                    "Answer naturally in English. Understand the user's intent from the conversation context; do not define individual words unless asked. Be accurate, relevant, concise, and use a few fitting emojis naturally. If unsure, say so. Keep correct English grammar and formatting."
-                else
-                    "فقط فارسی روان و طبیعی جواب بده. منظور جمله را با توجه به زمینه و پیام‌های قبلی بفهم؛ کلمه‌ها را جداگانه معنی نکن مگر اینکه کاربر معنی کلمه را خواسته باشد. دقیق، مرتبط و روشن پاسخ بده؛ از چند ایموجی مناسب و به‌اندازه استفاده کن. اگر مطمئن نیستی صادقانه بگو. دستور زبان و نیم‌فاصله فارسی را رعایت کن."
-                val contextualMessage = "[ASSISTANT INSTRUCTIONS]\n$languageInstruction\n\n[LATEST USER MESSAGE]\n$q"
-                val result = AlisanAiApi.ask(contextualMessage, history, outgoingAttachments)
+                // Worker فعلی endpoint جست‌وجو دارد؛ فقط متن واقعی کاربر را ارسال کن.
+                val result = AlisanAiApi.ask(q, history, outgoingAttachments)
                 chat = chat.dropLast(1) + ChatLine(result.answer, false, result.sources)
                 activity.speak(result.answer.take(3500), language)
             } catch (e: Exception) {
@@ -328,7 +324,7 @@ private fun ChatScreen(chat: List<ChatLine>, message: String, onMessage: (String
                         Column(Modifier.weight(1f)) {
                             Text("Alisan AI", color = Cyan, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                             Spacer(Modifier.height(5.dp)); Text(line.text, color = TextMain, fontSize = 15.sp, lineHeight = 23.sp)
-                            if (!line.text.startsWith("در حال دریافت") && line.text != "Thinking…") {
+                            if (!line.text.startsWith("در حال جست‌وجوی") && line.text != "Searching the web…") {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     IconButton(onClick = { onCopy(line.text) }, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.ContentCopy, if (en) "Copy" else "کپی", tint = TextMuted, modifier = Modifier.size(17.dp)) }
                                     IconButton(onClick = { onRetry(index) }, modifier = Modifier.size(34.dp)) { Icon(Icons.Default.Refresh, if (en) "Regenerate" else "پاسخ دوباره", tint = TextMuted, modifier = Modifier.size(18.dp)) }

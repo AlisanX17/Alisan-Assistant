@@ -9,6 +9,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
+import android.util.Base64
 import android.speech.*
 import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
@@ -89,7 +91,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-data class AiSource(val title: String, val url: String)
+data class SelectedAttachment(val name: String, val mimeType: String, val base64: String, val size: Int)
 data class ChatLine(val text: String, val isUser: Boolean, val sources: List<AiSource> = emptyList())
 data class ChatSession(val id: String, val title: String, val messages: List<ChatLine>)
 
@@ -146,6 +148,30 @@ fun AlisanAiApp() {
     val scope = rememberCoroutineScope()
     val keyboard = LocalSoftwareKeyboardController.current
     val clipboard = LocalClipboardManager.current
+    var selectedAttachments by remember { mutableStateOf(emptyList<SelectedAttachment>()) }
+    val attachmentPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        scope.launch {
+            val added = mutableListOf<SelectedAttachment>()
+            for (uri in uris.take((4 - selectedAttachments.size).coerceAtLeast(0))) {
+                try {
+                    val item = withContext(Dispatchers.IO) { readSelectedAttachment(context, uri) }
+                    if (item.size > 5 * 1024 * 1024) {
+                        speechError = if (en) "Each file must be 5 MB or smaller." else "حجم هر فایل باید حداکثر ۵ مگابایت باشد."
+                    } else if (item.mimeType !in listOf("image/jpeg", "image/png", "image/webp", "application/pdf", "text/plain")) {
+                        speechError = if (en) "This file type is not supported." else "این فرمت فایل پشتیبانی نمی‌شود."
+                    } else {
+                        added.add(item)
+                    }
+                } catch (_: Exception) {
+                    speechError = if (en) "Couldn't read the selected file." else "خواندن فایل انتخاب‌شده ناموفق بود."
+                }
+            }
+            selectedAttachments = (selectedAttachments + added).take(4)
+            if (uris.size > 4) speechError = if (en) "You can attach up to 4 files." else "حداکثر ۴ فایل می‌تونی اضافه کنی."
+        }
+    }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     LaunchedEffect(showDrawer) { if (showDrawer) drawerState.open() else drawerState.close() }
 
@@ -163,11 +189,15 @@ fun AlisanAiApp() {
         persist(); activeId = session.id; chat = session.messages; message = ""; currentTab = "chat"; showDrawer = false
     }
     fun sendMessage(raw: String) {
-        val q = raw.trim()
-        if (q.isBlank() || isLoading) return
+        val outgoingAttachments = selectedAttachments
+        val typed = raw.trim()
+        if ((typed.isBlank() && outgoingAttachments.isEmpty()) || isLoading) return
+        val q = typed.ifBlank { if (en) "Please analyze the attached file(s)." else "لطفاً فایل(های) پیوست‌شده را بررسی کن." }
         if (activeId.isBlank()) activeId = UUID.randomUUID().toString()
         keyboard?.hide()
-        val userLine = ChatLine(q, true)
+        val attachmentLabel = outgoingAttachments.joinToString("\n") { "📎 ${it.name}" }
+        val userLine = ChatLine(if (attachmentLabel.isBlank()) q else "$q\n$attachmentLabel", true)
+        selectedAttachments = emptyList()
         chat = chat + userLine + ChatLine(if (en) "Thinking…" else "در حال دریافت پاسخ…", false)
         message = ""; currentTab = "chat"; isLoading = true
         scope.launch {
@@ -184,7 +214,7 @@ fun AlisanAiApp() {
                     if (history.isNotBlank()) append("[CONVERSATION HISTORY]\n").append(history).append("\n")
                     append("[LATEST USER MESSAGE]\n").append(q)
                 }
-                val result = requestAlisanAi(contextualMessage)
+                val result = AlisanAiApi.ask(contextualMessage, outgoingAttachments)
                 chat = chat.dropLast(1) + ChatLine(result.answer, false, result.sources)
                 activity.speak(result.answer.take(3500), language)
             } catch (e: Exception) {
@@ -241,6 +271,9 @@ fun AlisanAiApp() {
                         if (noteDraft.isNotBlank()) { val n = "${System.currentTimeMillis()}|${noteDraft.trim()}"; notes = listOf(n) + notes; prefs.edit().putStringSet("notes", notes.toSet()).apply(); noteDraft = "" }
                     }, { n -> notes = notes.filterNot { it == n }; prefs.edit().putStringSet("notes", notes.toSet()).apply() }, en)
                     else -> ChatScreen(chat, message, { message = it }, listening, speechError, pulse, isLoading, en,
+                        attachments = selectedAttachments,
+                        onPickAttachment = { attachmentPicker.launch(arrayOf("image/*", "application/pdf", "text/plain")) },
+                        onRemoveAttachment = { item -> selectedAttachments = selectedAttachments.filterNot { it == item } },
                         onSend = { sendMessage(message) },
                         onMic = { if (listening) listening = false else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) startListening(context, language, { listening = it }, { sendMessage(it) }, { listening = false; speechError = if (en) "Speech recognition failed. Check your device's speech service and language pack." else "تشخیص صدا ناموفق بود؛ سرویس گفتار و زبان فارسی گوشی را بررسی کن." }) else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO) },
                         onOpenLink = { url -> runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) } },
@@ -268,7 +301,7 @@ fun AlisanAiApp() {
 }
 
 @Composable
-private fun ChatScreen(chat: List<ChatLine>, message: String, onMessage: (String) -> Unit, listening: Boolean, speechError: String, pulse: Float, isLoading: Boolean, en: Boolean, onSend: () -> Unit, onMic: () -> Unit, onOpenLink: (String) -> Unit, onCopy: (String) -> Unit, onSpeak: (String) -> Unit, onRetry: (Int) -> Unit) {
+private fun ChatScreen(chat: List<ChatLine>, message: String, onMessage: (String) -> Unit, listening: Boolean, speechError: String, pulse: Float, isLoading: Boolean, en: Boolean, attachments: List<SelectedAttachment>, onPickAttachment: () -> Unit, onRemoveAttachment: (SelectedAttachment) -> Unit, onSend: () -> Unit, onMic: () -> Unit, onOpenLink: (String) -> Unit, onCopy: (String) -> Unit, onSpeak: (String) -> Unit, onRetry: (Int) -> Unit) {
     val keyboard = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
     Column(Modifier.fillMaxSize().imePadding().padding(horizontal = 16.dp)) {
@@ -318,12 +351,31 @@ private fun ChatScreen(chat: List<ChatLine>, message: String, onMessage: (String
         AnimatedVisibility(listening) { Text(if (en) "Listening…" else "در حال گوش دادن…", color = Cyan, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center) }
         AnimatedVisibility(speechError.isNotBlank()) { Text(speechError, color = Color(0xFFFCA5A5), fontSize = 12.sp) }
         AnimatedVisibility(isLoading) { OrbitingMoonLoader(en) }
+        if (attachments.isNotEmpty()) {
+            Column(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 4.dp)) {
+                attachments.forEach { item ->
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 3.dp)
+                            .background(SurfaceRaised, RoundedCornerShape(10.dp)).padding(horizontal = 10.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(if (item.mimeType.startsWith("image/")) Icons.Default.Image else Icons.Default.AttachFile, null, tint = Cyan, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(7.dp))
+                        Text(item.name, color = TextMain, fontSize = 12.sp, modifier = Modifier.weight(1f), maxLines = 1)
+                        IconButton(onClick = { onRemoveAttachment(item) }, modifier = Modifier.size(28.dp)) {
+                            Icon(Icons.Default.Close, if (en) "Remove attachment" else "حذف پیوست", tint = TextMuted, modifier = Modifier.size(16.dp))
+                        }
+                    }
+                }
+            }
+        }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 10.dp).background(SurfaceDark, RoundedCornerShape(25.dp)).border(1.dp, Color(0xFF273448), RoundedCornerShape(25.dp)).padding(horizontal = 7.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onMic, modifier = Modifier.size(42.dp).background(SurfaceRaised, CircleShape)) { Icon(Icons.Default.Mic, null, tint = Cyan) }
-            BasicTextField(value = message, onValueChange = onMessage, modifier = Modifier.weight(1f).padding(horizontal = 10.dp).focusRequester(focusRequester), textStyle = TextStyle(color = TextMain, fontSize = 15.sp), singleLine = false, maxLines = 5,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send), keyboardActions = KeyboardActions(onSend = { if (message.isNotBlank() && !isLoading) { keyboard?.hide(); onSend() } }),
+            IconButton(onClick = onPickAttachment, enabled = !isLoading, modifier = Modifier.size(38.dp)) { Icon(Icons.Default.AttachFile, if (en) "Attach file or image" else "افزودن عکس یا فایل", tint = Cyan) }
+            IconButton(onClick = onMic, modifier = Modifier.size(38.dp).background(SurfaceRaised, CircleShape)) { Icon(Icons.Default.Mic, null, tint = Cyan) }
+            BasicTextField(value = message, onValueChange = onMessage, modifier = Modifier.weight(1f).padding(horizontal = 8.dp).focusRequester(focusRequester), textStyle = TextStyle(color = TextMain, fontSize = 15.sp), singleLine = false, maxLines = 5,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send), keyboardActions = KeyboardActions(onSend = { if ((message.isNotBlank() || attachments.isNotEmpty()) && !isLoading) { keyboard?.hide(); onSend() } }),
                 decorationBox = { inner -> Box { if (message.isEmpty()) Text(if (en) "Message Alisan AI…" else "پیامت رو بنویس…", color = TextMuted, fontSize = 14.sp); inner() } })
-            IconButton(onClick = { keyboard?.hide(); onSend() }, enabled = message.isNotBlank() && !isLoading, modifier = Modifier.size(42.dp).background(Brush.linearGradient(listOf(Blue, Color(0xFF6366F1))), CircleShape)) { Icon(Icons.Default.Send, null, tint = Color.White) }
+            IconButton(onClick = { keyboard?.hide(); onSend() }, enabled = (message.isNotBlank() || attachments.isNotEmpty()) && !isLoading, modifier = Modifier.size(42.dp).background(Brush.linearGradient(listOf(Blue, Color(0xFF6366F1))), CircleShape)) { Icon(Icons.Default.Send, null, tint = Color.White) }
         }
     }
 }
@@ -356,21 +408,30 @@ private fun NotesScreen(notes: List<String>, draft: String, onDraft: (String) ->
     }
 }
 
-private data class AiReply(val answer: String, val sources: List<AiSource>)
-private suspend fun requestAlisanAi(message: String): AiReply = withContext(Dispatchers.IO) {
-    val connection = URL("https://ai.hunterdns.shop/chat").openConnection() as HttpURLConnection
-    try {
-        connection.requestMethod = "POST"; connection.connectTimeout = 15000; connection.readTimeout = 90000; connection.doOutput = true
-        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8"); connection.setRequestProperty("Accept", "application/json")
-        connection.outputStream.use { it.write(JSONObject().put("message", message).toString().toByteArray(Charsets.UTF_8)) }
-        val status = connection.responseCode; val stream = if (status in 200..299) connection.inputStream else connection.errorStream
-        val json = JSONObject(stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: "{}")
-        if (status !in 200..299) throw Exception(json.optString("error", "HTTP $status"))
-        val answer = json.optString("answer").ifBlank { throw Exception("Empty response") }
-        val sources = mutableListOf<AiSource>(); val arr = json.optJSONArray("sources")
-        if (arr != null) for (i in 0 until arr.length()) { val o = arr.optJSONObject(i) ?: continue; val link = o.optString("url"); if (link.startsWith("https://") || link.startsWith("http://")) sources.add(AiSource(o.optString("title", link), link)) }
-        AiReply(answer, sources)
-    } finally { connection.disconnect() }
+private fun readSelectedAttachment(context: Context, uri: Uri): SelectedAttachment {
+    val resolver = context.contentResolver
+    val mime = resolver.getType(uri)?.lowercase() ?: "application/octet-stream"
+    var name = uri.lastPathSegment?.substringAfterLast('/') ?: "attachment"
+    resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+        if (cursor.moveToFirst()) {
+            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (index >= 0) name = cursor.getString(index) ?: name
+        }
+    }
+    val bytes = resolver.openInputStream(uri)?.use { input ->
+        val output = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(8192)
+        var total = 0
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            total += count
+            if (total > 5 * 1024 * 1024) throw IllegalArgumentException("File too large")
+            output.write(buffer, 0, count)
+        }
+        output.toByteArray()
+    } ?: throw IllegalArgumentException("Cannot open file")
+    return SelectedAttachment(name, mime, Base64.encodeToString(bytes, Base64.NO_WRAP), bytes.size)
 }
 
 private fun startListening(context: Context, language: String, onListening: (Boolean) -> Unit, onResult: (String) -> Unit, onFailure: () -> Unit) {

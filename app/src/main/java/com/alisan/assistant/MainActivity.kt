@@ -1,5 +1,4 @@
 package com.alisan.assistant
-
 import android.Manifest
 import android.app.AlarmManager
 import android.app.PendingIntent
